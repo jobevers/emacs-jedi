@@ -260,9 +260,7 @@ at the top."
   :group 'jedi)
 
 (defcustom jedi:install-imenu nil
-  "[EXPERIMENTAL] If `t', use Jedi to create `imenu' index.
-To use this feature, you need to install the developmental
-version (\"dev\" branch) of Jedi."
+  "If `t', use Jedi to create `imenu' index."
   :group 'jedi)
 
 (defcustom jedi:imenu-create-index-function 'jedi:create-nested-imenu-index
@@ -457,17 +455,64 @@ connection."
        (when something-happened
          ,@run-on-error))))
 
+(defun jedi:epc--make-server-output-msg (line-count)
+  "Extract up to LINE-COUNT last lines from last failed EPC buffer."
+  (let ((epc-buffer (get-buffer (epc:server-buffer-name epc:uid)))
+        is-part lines)
+    (if (not (buffer-live-p epc-buffer))
+        ""
+      (save-excursion
+        (set-buffer epc-buffer)
+        (goto-char (point-max))
+        (forward-line -10)
+        (setq is-part (not (eq (point) (point-min))))
+        (setq lines (buffer-substring-no-properties (point) (point-max))))
+      (format "*** EPC Server Output (last %s lines) ***\n%s%s\n"
+              line-count
+              (if is-part "<...snipped, see all with `epc:pop-to-last-server-process-buffer'...>\n" "")
+              lines))))
+
+
 (defun jedi:epc--start-epc (server-prog server-args)
   "Same as `epc:start-epc', but set query-on-exit flag for
 associated processes to nil."
-  (let ((mngr (jedi:-with-run-on-error
-                  (epc:start-epc server-prog server-args)
-                (display-warning 'jedi "\
+  (let ((mngr
+         (condition-case epc-error
+             (epc:start-epc server-prog server-args)
+           (error
+            (let* ((cmdline-args (append (list server-prog) server-args))
+                   (cmd (executable-find server-prog))
+                   (cmd-str (or cmd
+                                (format "nil (%S not found in exec-path)"
+                                        server-prog)))
+                   (virtual-env (getenv "VIRTUAL_ENV"))
+                   (warning-msg (format "
+================================
 Failed to start Jedi EPC server.
+================================
+
+*** EPC Error ***
+%s
+
+%s
+*** EPC Server Config ***
+Server arguments: %S
+Actual command: %s
+VIRTUAL_ENV envvar: %S
+
+*** jedi-mode is disabled in %S ***
+Fix the problem and re-enable it.
+
 *** You may need to run \"M-x jedi:install-server\". ***
 This could solve the problem especially if you haven't run the command yet
 since Jedi.el installation or update and if the server complains about
-Python module imports." :error))))
+Python module imports."
+                                        (cadr epc-error)
+                                        (jedi:epc--make-server-output-msg 10)
+                                        cmdline-args cmd-str virtual-env
+                                        (current-buffer))))
+              (display-warning 'jedi warning-msg :error)
+              (jedi-mode 0))))))
     (set-process-query-on-exit-flag (epc:connection-process
                                      (epc:manager-connection mngr))
                                     nil)
@@ -480,15 +525,23 @@ Python module imports." :error))))
 (defvar jedi:server-pool--table (make-hash-table :test 'equal)
   "A hash table that holds a pool of EPC server instances.")
 
+(defun jedi:server-pool--resolve-command (command)
+  "Resolve COMMAND using current environment.
+Tries to find (car command) in \"exec-path\"."
+  (let (command-path (executable-find (car command)))
+    (if command-path
+        (cons command-path (cdr command))
+      command)))
+
 (defun jedi:server-pool--start (command)
-  "Get an EPC server instance from server pool by COMMAND as a
-key, or start new one if there is none."
-  (let ((cached (gethash command jedi:server-pool--table)))
+  "Get an EPC server for COMMAND from server pool or start a new one."
+  (let* ((resolved-command (jedi:server-pool--resolve-command command))
+         (cached (gethash resolved-command jedi:server-pool--table)))
     (if (and cached (jedi:epc--live-p cached))
         cached
       (let* ((default-directory "/")
-             (mngr (jedi:epc--start-epc (car command) (cdr command))))
-        (puthash command mngr jedi:server-pool--table)
+             (mngr (jedi:epc--start-epc (car resolved-command) (cdr command))))
+        (puthash resolved-command mngr jedi:server-pool--table)
         (jedi:server-pool--gc-when-idle)
         mngr))))
 
@@ -546,7 +599,19 @@ later when it is needed."
   (setq jedi:get-in-function-call--d nil)
   (setq jedi:defined-names--singleton-d nil))
 
+(defun jedi:stop-all-servers ()
+  "Stop all live Jedi servers.
+This is useful to apply new settings or VIRTUAL_ENV variable
+value to all buffers."
+  (interactive)
+  (cl-dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (jedi:epc--live-p jedi:epc)
+          (jedi:stop-server))))))
+
 (defun jedi:get-epc ()
+  "Get an EPC instance of a running server or start a new one."
   (if (jedi:epc--live-p jedi:epc)
       jedi:epc
     (jedi:start-server)))
@@ -589,7 +654,8 @@ See: https://github.com/tkf/emacs-jedi/issues/54"
 (defun jedi:call-deferred (method-name)
   "Call ``Script(...).METHOD-NAME`` and return a deferred object."
   (let ((source      (buffer-substring-no-properties (point-min) (point-max)))
-        (line        (count-lines (point-min) (min (1+ (point)) (point-max))))
+        ;; line=0 is an error for jedi, but is possible for empty buffers.
+        (line        (max 1 (count-lines (point-min) (min (1+ (point)) (point-max)))))
         (column      (- (point) (line-beginning-position)))
         (source-path (jedi:-buffer-file-name)))
     (epc:call-deferred (jedi:get-epc)
@@ -1193,7 +1259,7 @@ See also:
 
 (defcustom jedi:install-python-jedi-dev-command
   '("pip" "install" "--upgrade"
-    "git+https://github.com/davidhalter/jedi.git@dev#egg=jedi")
+    "git+https://github.com/davidhalter/jedi.git@master#egg=jedi")
   "Pip command to be used for `jedi:install-python-jedi-dev'."
   :group 'jedi)
 
